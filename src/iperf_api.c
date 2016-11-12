@@ -55,6 +55,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <linux/vm_sockets.h>
 
 #if defined(HAVE_CPUSET_SETAFFINITY)
 #include <sys/param.h>
@@ -543,6 +544,7 @@ iperf_on_connect(struct iperf_test *test)
     struct sockaddr_storage sa;
     struct sockaddr_in *sa_inP;
     struct sockaddr_in6 *sa_in6P;
+    struct sockaddr_vm *sa_vmP;
     socklen_t len;
     int opt;
 
@@ -568,12 +570,17 @@ iperf_on_connect(struct iperf_test *test)
 	    sa_inP = (struct sockaddr_in *) &sa;
             inet_ntop(AF_INET, &sa_inP->sin_addr, ipr, sizeof(ipr));
 	    port = ntohs(sa_inP->sin_port);
-        } else {
+	    mapped_v4_to_regular_v4(ipr);
+        } else if (getsockdomain(test->ctrl_sck) == AF_INET6) {
 	    sa_in6P = (struct sockaddr_in6 *) &sa;
             inet_ntop(AF_INET6, &sa_in6P->sin6_addr, ipr, sizeof(ipr));
 	    port = ntohs(sa_in6P->sin6_port);
+        } else {
+            /* if (getsockdomain(test->ctrl_sck) == AF_VSOCK) */
+            sa_vmP = (struct sockaddr_vm *) &sa;
+            snprintf(ipr, sizeof(ipr), "%u", sa_vmP->svm_cid);
+            port = sa_vmP->svm_port;
         }
-	mapped_v4_to_regular_v4(ipr);
 	if (test->json_output)
 	    cJSON_AddItemToObject(test->json_start, "accepted_connection", iperf_json_printf("host: %s  port: %d", ipr, (int64_t) port));
 	else
@@ -685,7 +692,7 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
 
     blksize = 0;
     server_flag = client_flag = rate_flag = duration_flag = 0;
-    while ((flag = getopt_long(argc, argv, "p:f:i:D1VJvsc:ub:t:n:k:l:P:Rw:B:M:N46S:L:ZO:F:A:T:C:dI:hX:", longopts, NULL)) != -1) {
+    while ((flag = getopt_long(argc, argv, "p:f:i:D1VJvsc:ub:t:n:k:l:P:Rw:B:M:N460S:L:ZO:F:A:T:C:dI:hX:", longopts, NULL)) != -1) {
         switch (flag) {
             case 'p':
                 test->server_port = atoi(optarg);
@@ -838,6 +845,9 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
                 break;
             case '6':
                 test->settings->domain = AF_INET6;
+                break;
+            case '0':
+                test->settings->domain = AF_VSOCK;
                 break;
             case 'S':
                 test->settings->tos = strtol(optarg, &endptr, 0);
@@ -1750,6 +1760,7 @@ add_to_interval_list(struct iperf_stream_result * rp, struct iperf_interval_resu
 void
 connect_msg(struct iperf_stream *sp)
 {
+    struct sockaddr_vm *vmP;
     char ipl[INET6_ADDRSTRLEN], ipr[INET6_ADDRSTRLEN];
     int lport, rport;
 
@@ -1760,13 +1771,21 @@ connect_msg(struct iperf_stream *sp)
 	mapped_v4_to_regular_v4(ipr);
         lport = ntohs(((struct sockaddr_in *) &sp->local_addr)->sin_port);
         rport = ntohs(((struct sockaddr_in *) &sp->remote_addr)->sin_port);
-    } else {
+    } else if (getsockdomain(sp->socket) == AF_INET6) {
         inet_ntop(AF_INET6, (void *) &((struct sockaddr_in6 *) &sp->local_addr)->sin6_addr, ipl, sizeof(ipl));
 	mapped_v4_to_regular_v4(ipl);
         inet_ntop(AF_INET6, (void *) &((struct sockaddr_in6 *) &sp->remote_addr)->sin6_addr, ipr, sizeof(ipr));
 	mapped_v4_to_regular_v4(ipr);
         lport = ntohs(((struct sockaddr_in6 *) &sp->local_addr)->sin6_port);
         rport = ntohs(((struct sockaddr_in6 *) &sp->remote_addr)->sin6_port);
+    } else {
+        /* if (getsockdomain(sp->socket) == AF_VSOCK) */
+        vmP = (struct sockaddr_vm *) &sp->local_addr;
+        snprintf(ipl, sizeof(ipl), "%u", vmP->svm_cid);
+        lport = vmP->svm_port;
+        vmP = (struct sockaddr_vm *) &sp->local_addr;
+        snprintf(ipr, sizeof(ipr), "%u", vmP->svm_cid);
+        rport = vmP->svm_port;
     }
 
     if (sp->test->json_output)
@@ -2855,7 +2874,7 @@ iperf_init_stream(struct iperf_stream *sp, struct iperf_test *test)
             i_errno = IESETCOS;
             return -1;
 #endif
-        } else {
+        } else if (getsockdomain(sp->socket) == AF_INET) {
             if (setsockopt(sp->socket, IPPROTO_IP, IP_TOS, &opt, sizeof(opt)) < 0) {
                 i_errno = IESETTOS;
                 return -1;

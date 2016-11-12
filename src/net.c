@@ -27,6 +27,7 @@
 #include "iperf_config.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -38,6 +39,7 @@
 #include <netdb.h>
 #include <string.h>
 #include <sys/fcntl.h>
+#include <linux/vm_sockets.h>
 
 #ifdef HAVE_SENDFILE
 #ifdef linux
@@ -68,8 +70,11 @@
 int
 netdial(int domain, int proto, char *local, int local_port, char *server, int port)
 {
-    struct addrinfo hints, *local_res, *server_res;
-    int s;
+    struct addrinfo hints, *local_res, *server_res = NULL;
+    struct sockaddr *addr;
+    struct sockaddr_vm svm;
+    socklen_t len;
+    int s, cid;
 
     if (local) {
         memset(&hints, 0, sizeof(hints));
@@ -82,14 +87,32 @@ netdial(int domain, int proto, char *local, int local_port, char *server, int po
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = domain;
     hints.ai_socktype = proto;
-    if (getaddrinfo(server, NULL, &hints, &server_res) != 0)
-        return -1;
+    if (domain != AF_VSOCK) {
+        if (getaddrinfo(server, NULL, &hints, &server_res) != 0)
+            return -1;
+        ((struct sockaddr_in *) server_res->ai_addr)->sin_port = htons(port);
+        addr = (struct sockaddr *) server_res->ai_addr;
+        len = server_res->ai_addrlen;
+    } else {
+	cid = parse_cid(server);
+	if (cid < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+        memset(&svm, 0, sizeof(svm));
+        svm.svm_family = AF_VSOCK;
+	svm.svm_cid = cid;
+	svm.svm_port = port;
+        addr = (struct sockaddr *)&svm;
+        len = sizeof(svm);
+    }
 
-    s = socket(server_res->ai_family, proto, 0);
+    s = socket(domain, proto, 0);
     if (s < 0) {
 	if (local)
 	    freeaddrinfo(local_res);
-	freeaddrinfo(server_res);
+	if (server_res)
+                freeaddrinfo(server_res);
         return -1;
     }
 
@@ -110,14 +133,15 @@ netdial(int domain, int proto, char *local, int local_port, char *server, int po
         freeaddrinfo(local_res);
     }
 
-    ((struct sockaddr_in *) server_res->ai_addr)->sin_port = htons(port);
-    if (connect(s, (struct sockaddr *) server_res->ai_addr, server_res->ai_addrlen) < 0 && errno != EINPROGRESS) {
+    if (connect(s, addr, len) < 0 && errno != EINPROGRESS) {
+        if (server_res)
+            freeaddrinfo(server_res);
 	close(s);
-	freeaddrinfo(server_res);
         return -1;
     }
 
-    freeaddrinfo(server_res);
+    if (server_res)
+        freeaddrinfo(server_res);
     return s;
 }
 
@@ -126,7 +150,10 @@ netdial(int domain, int proto, char *local, int local_port, char *server, int po
 int
 netannounce(int domain, int proto, char *local, int port)
 {
-    struct addrinfo hints, *res;
+    struct addrinfo hints, *res = NULL;
+    struct sockaddr *addr;
+    struct sockaddr_vm svm;
+    socklen_t len;
     char portstr[6];
     int s, opt;
 
@@ -152,22 +179,18 @@ netannounce(int domain, int proto, char *local, int port)
     }
     hints.ai_socktype = proto;
     hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo(local, portstr, &hints, &res) != 0)
-        return -1; 
 
-    s = socket(res->ai_family, proto, 0);
+    s = socket(hints.ai_family, proto, 0);
     if (s < 0) {
-	freeaddrinfo(res);
         return -1;
     }
-
     opt = 1;
-    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, 
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
 		   (char *) &opt, sizeof(opt)) < 0) {
 	close(s);
-	freeaddrinfo(res);
 	return -1;
     }
+
     /*
      * If we got an IPv6 socket, figure out if it should accept IPv4
      * connections as well.  We do that if and only if no address
@@ -177,7 +200,7 @@ netannounce(int domain, int proto, char *local, int port)
      * even though it implements IPV6_V6ONLY.
      */
 #if defined(IPV6_V6ONLY) && !defined(__OpenBSD__)
-    if (res->ai_family == AF_INET6 && (domain == AF_UNSPEC || domain == AF_INET6)) {
+    if (hints.ai_family == AF_INET6 && (domain == AF_UNSPEC || domain == AF_INET6)) {
 	if (domain == AF_UNSPEC)
 	    opt = 0;
 	else
@@ -185,20 +208,41 @@ netannounce(int domain, int proto, char *local, int port)
 	if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, 
 		       (char *) &opt, sizeof(opt)) < 0) {
 	    close(s);
-	    freeaddrinfo(res);
 	    return -1;
 	}
     }
 #endif /* IPV6_V6ONLY */
 
-    if (bind(s, (struct sockaddr *) res->ai_addr, res->ai_addrlen) < 0) {
-        close(s);
-	freeaddrinfo(res);
-        return -1;
+    /* getaddrinfo does not support AF_VSOCK */
+    if (hints.ai_family == AF_VSOCK) {
+        memset(&svm, 0, sizeof(svm));
+        svm.svm_family = AF_VSOCK;
+        svm.svm_cid = VMADDR_CID_ANY;
+        svm.svm_port = port;
+        addr = (struct sockaddr *)&svm;
+        len = sizeof(svm);
+    } else {
+	if (getaddrinfo(local, portstr, &hints, &res) != 0) {
+           close(s);
+           return -1;
+        } else if (res->ai_family != hints.ai_family) {
+           freeaddrinfo(res);
+           close(s);
+           return -1;
+        }
+        addr = res->ai_addr;
+        len = res->ai_addrlen;
     }
 
-    freeaddrinfo(res);
-    
+    if (bind(s, addr, len) < 0) {
+        if (res)
+            freeaddrinfo(res);
+        close(s);
+        return -1;
+    }
+    if (res)
+        freeaddrinfo(res);
+
     if (proto == SOCK_STREAM) {
         if (listen(s, 5) < 0) {
 	    close(s);
@@ -464,4 +508,18 @@ getsockdomain(int sock)
         return -1;
     }
     return ((struct sockaddr *) &sa)->sa_family;
+}
+
+/****************************************************************************/
+int parse_cid(const char *cid_str)
+{
+        char *end = NULL;
+        long cid = strtol(cid_str, &end, 10);
+        if (cid_str != end && *end == '\0') {
+                return cid;
+        } else {
+                fprintf(stderr, "invalid cid: %s\n", cid_str);
+		errno = EINVAL;
+                return -1;
+        }
 }

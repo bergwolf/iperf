@@ -516,7 +516,7 @@ iperf_run_server(struct iperf_test *test)
 		    }
 
 #if defined(HAVE_TCP_CONGESTION)
-		    if (test->protocol->id == Ptcp) {
+		    if (test->protocol->id == Ptcp && test->settings->domain != AF_VSOCK) {
 			if (test->congestion) {
 			    if (setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, test->congestion, strlen(test->congestion)) < 0) {
 				close(s);

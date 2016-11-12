@@ -38,6 +38,7 @@
 #include <netinet/tcp.h>
 #include <sys/time.h>
 #include <sys/select.h>
+#include <linux/vm_sockets.h>
 
 #include "iperf.h"
 #include "iperf_api.h"
@@ -137,6 +138,9 @@ int
 iperf_tcp_listen(struct iperf_test *test)
 {
     struct addrinfo hints, *res;
+    struct sockaddr_vm svm;
+    struct sockaddr *addr;
+    socklen_t len;
     char portstr[6];
     int s, opt;
     int saved_errno;
@@ -172,13 +176,7 @@ iperf_tcp_listen(struct iperf_test *test)
 	}
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_flags = AI_PASSIVE;
-        if (getaddrinfo(test->bind_address, portstr, &hints, &res) != 0) {
-            i_errno = IESTREAMLISTEN;
-            return -1;
-        }
-
-        if ((s = socket(res->ai_family, SOCK_STREAM, 0)) < 0) {
-	    freeaddrinfo(res);
+        if ((s = socket(hints.ai_family, SOCK_STREAM, 0)) < 0) {
             i_errno = IESTREAMLISTEN;
             return -1;
         }
@@ -188,7 +186,6 @@ iperf_tcp_listen(struct iperf_test *test)
             if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
                 i_errno = IESETNODELAY;
                 return -1;
@@ -199,7 +196,6 @@ iperf_tcp_listen(struct iperf_test *test)
             if (setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
                 i_errno = IESETMSS;
                 return -1;
@@ -209,7 +205,6 @@ iperf_tcp_listen(struct iperf_test *test)
             if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
                 i_errno = IESETBUF;
                 return -1;
@@ -217,7 +212,6 @@ iperf_tcp_listen(struct iperf_test *test)
             if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
                 i_errno = IESETBUF;
                 return -1;
@@ -228,7 +222,6 @@ iperf_tcp_listen(struct iperf_test *test)
 	    if (getsockopt(s, SOL_SOCKET, SO_SNDBUF, &opt, &optlen) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
 		i_errno = IESETBUF;
 		return -1;
@@ -255,19 +248,18 @@ iperf_tcp_listen(struct iperf_test *test)
         if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
 	    saved_errno = errno;
             close(s);
-	    freeaddrinfo(res);
 	    errno = saved_errno;
             i_errno = IEREUSEADDR;
             return -1;
         }
 
 	/*
-	 * If we got an IPv6 socket, figure out if it shoudl accept IPv4
+	 * If we got an IPv6 socket, figure out if it should accept IPv4
 	 * connections as well.  See documentation in netannounce() for
 	 * more details.
 	 */
 #if defined(IPV6_V6ONLY) && !defined(__OpenBSD__)
-	if (res->ai_family == AF_INET6 && (test->settings->domain == AF_UNSPEC || test->settings->domain == AF_INET)) {
+	if (hints.ai_family == AF_INET6 && (test->settings->domain == AF_UNSPEC || test->settings->domain == AF_INET)) {
 	    if (test->settings->domain == AF_UNSPEC)
 		opt = 0;
 	    else 
@@ -276,7 +268,6 @@ iperf_tcp_listen(struct iperf_test *test)
 			   (char *) &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
 		close(s);
-		freeaddrinfo(res);
 		errno = saved_errno;
 		i_errno = IEV6ONLY;
 		return -1;
@@ -284,16 +275,34 @@ iperf_tcp_listen(struct iperf_test *test)
 	}
 #endif /* IPV6_V6ONLY */
 
-        if (bind(s, (struct sockaddr *) res->ai_addr, res->ai_addrlen) < 0) {
+	if (hints.ai_family == AF_VSOCK) {
+	    memset(&svm, 0, sizeof(svm));
+	    svm.svm_family = AF_VSOCK;
+	    svm.svm_cid = VMADDR_CID_ANY;
+	    svm.svm_port = test->server_port;
+	    addr = (struct sockaddr *)&svm;
+	    len = sizeof(svm);
+	} else {
+            if (getaddrinfo(test->bind_address, portstr, &hints, &res) != 0) {
+                i_errno = IESTREAMLISTEN;
+                return -1;
+            }
+	    addr = (struct sockaddr *) res->ai_addr;
+	    len = res->ai_addrlen;
+	}
+
+        if (bind(s, addr, len) < 0) {
 	    saved_errno = errno;
             close(s);
-	    freeaddrinfo(res);
+	    if (res)
+		freeaddrinfo(res);
 	    errno = saved_errno;
             i_errno = IESTREAMLISTEN;
             return -1;
         }
 
-        freeaddrinfo(res);
+	if (res)
+	    freeaddrinfo(res);
 
         if (listen(s, 5) < 0) {
             i_errno = IESTREAMLISTEN;
@@ -302,7 +311,7 @@ iperf_tcp_listen(struct iperf_test *test)
 
         test->listener = s;
     }
-    
+
     return s;
 }
 
@@ -314,9 +323,12 @@ iperf_tcp_listen(struct iperf_test *test)
 int
 iperf_tcp_connect(struct iperf_test *test)
 {
-    struct addrinfo hints, *local_res, *server_res;
+    struct addrinfo hints, *local_res, *server_res = NULL;
+    struct sockaddr_vm svm;
+    struct sockaddr *addr;
+    socklen_t len;
     char portstr[6];
-    int s, opt;
+    int s, opt, cid;
     int saved_errno;
 
     if (test->bind_address) {
@@ -332,18 +344,10 @@ iperf_tcp_connect(struct iperf_test *test)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = test->settings->domain;
     hints.ai_socktype = SOCK_STREAM;
-    snprintf(portstr, sizeof(portstr), "%d", test->server_port);
-    if (getaddrinfo(test->server_hostname, portstr, &hints, &server_res) != 0) {
-	if (test->bind_address)
-	    freeaddrinfo(local_res);
-        i_errno = IESTREAMCONNECT;
-        return -1;
-    }
 
-    if ((s = socket(server_res->ai_family, SOCK_STREAM, 0)) < 0) {
+    if ((s = socket(hints.ai_family, SOCK_STREAM, 0)) < 0) {
 	if (test->bind_address)
 	    freeaddrinfo(local_res);
-	freeaddrinfo(server_res);
         i_errno = IESTREAMCONNECT;
         return -1;
     }
@@ -358,7 +362,6 @@ iperf_tcp_connect(struct iperf_test *test)
 	    saved_errno = errno;
 	    close(s);
 	    freeaddrinfo(local_res);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESTREAMCONNECT;
             return -1;
@@ -372,7 +375,6 @@ iperf_tcp_connect(struct iperf_test *test)
         if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESETNODELAY;
             return -1;
@@ -382,7 +384,6 @@ iperf_tcp_connect(struct iperf_test *test)
         if (setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, &opt, sizeof(opt)) < 0) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESETMSS;
             return -1;
@@ -392,7 +393,6 @@ iperf_tcp_connect(struct iperf_test *test)
         if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt)) < 0) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESETBUF;
             return -1;
@@ -400,7 +400,6 @@ iperf_tcp_connect(struct iperf_test *test)
         if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt)) < 0) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESETBUF;
             return -1;
@@ -411,19 +410,45 @@ iperf_tcp_connect(struct iperf_test *test)
 	if (getsockopt(s, SOL_SOCKET, SO_SNDBUF, &opt, &optlen) < 0) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
 	    errno = saved_errno;
 	    i_errno = IESETBUF;
 	    return -1;
 	}
 	printf("SO_SNDBUF is %u\n", opt);
     }
+
+    if (hints.ai_family == AF_VSOCK) {
+	cid = parse_cid(test->server_hostname);
+	if (cid < 0) {
+	        close(s);
+	        errno = EINVAL;
+		return -1;
+	}
+	memset(&svm, 0, sizeof(svm));
+	svm.svm_family = AF_VSOCK;
+	svm.svm_cid = cid;
+	svm.svm_port = test->server_port;
+	addr = (struct sockaddr *)&svm;
+	len = sizeof(svm);
+    } else {
+	snprintf(portstr, sizeof(portstr), "%d", test->server_port);
+	if (getaddrinfo(test->server_hostname, portstr, &hints, &server_res) != 0) {
+	    if (test->bind_address)
+		freeaddrinfo(local_res);
+	    i_errno = IESTREAMCONNECT;
+	    return -1;
+	}
+	addr = (struct sockaddr *)server_res->ai_addr;
+	len = server_res->ai_addrlen;
+    }
+
 #if defined(HAVE_FLOWLABEL)
     if (test->settings->flowlabel) {
         if (server_res->ai_addr->sa_family != AF_INET6) {
 	    saved_errno = errno;
 	    close(s);
-	    freeaddrinfo(server_res);
+	    if (server_res)
+	        freeaddrinfo(server_res);
 	    errno = saved_errno;
             i_errno = IESETFLOW;
             return -1;
@@ -443,7 +468,8 @@ iperf_tcp_connect(struct iperf_test *test)
             if (setsockopt(s, IPPROTO_IPV6, IPV6_FLOWLABEL_MGR, freq, freq_len) < 0) {
 		saved_errno = errno;
                 close(s);
-                freeaddrinfo(server_res);
+		if (server_res)
+                    freeaddrinfo(server_res);
 		errno = saved_errno;
                 i_errno = IESETFLOW;
                 return -1;
@@ -454,7 +480,8 @@ iperf_tcp_connect(struct iperf_test *test)
             if (setsockopt(s, IPPROTO_IPV6, IPV6_FLOWINFO_SEND, &opt, sizeof(opt)) < 0) {
 		saved_errno = errno;
                 close(s);
-                freeaddrinfo(server_res);
+		if (server_res)
+                    freeaddrinfo(server_res);
 		errno = saved_errno;
                 i_errno = IESETFLOW;
                 return -1;
@@ -480,16 +507,18 @@ iperf_tcp_connect(struct iperf_test *test)
     }
 #endif /* HAVE_SO_MAX_PACING_RATE */
 
-    if (connect(s, (struct sockaddr *) server_res->ai_addr, server_res->ai_addrlen) < 0 && errno != EINPROGRESS) {
+    if (connect(s, addr, len) < 0 && errno != EINPROGRESS) {
 	saved_errno = errno;
 	close(s);
-	freeaddrinfo(server_res);
+	if (server_res)
+	    freeaddrinfo(server_res);
 	errno = saved_errno;
         i_errno = IESTREAMCONNECT;
         return -1;
     }
 
-    freeaddrinfo(server_res);
+    if (server_res)
+        freeaddrinfo(server_res);
 
     /* Send cookie for verification */
     if (Nwrite(s, test->cookie, COOKIE_SIZE, Ptcp) < 0) {

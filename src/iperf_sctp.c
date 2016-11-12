@@ -478,7 +478,10 @@ iperf_sctp_bindx(struct iperf_test *test, int s, int is_server)
         } else if (sa->sa_family == AF_INET6) {
             sin6 = (struct sockaddr_in6 *)ai->ai_addr;
             eport = sin6->sin6_port;
-        } else {
+        } else if (sa->sa_family == AF_VSOCK) {
+	    svm = (struct sockaddr_vm *)ai->ai_addr;
+	    eport = svm->svm_port;
+	} else {
             i_errno = IESETSCTPBINDX;
             retval = -1;
             goto out;
